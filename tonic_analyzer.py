@@ -587,6 +587,31 @@ def merge_same_pc(segments):
     return segments
 
 
+def compose_single(segments, members, root):
+    fs = np.array([float(segments[i].get("f", float("nan"))) for i in members])
+    ws = np.array([segments[i]["dur_w"] for i in members])
+    g0 = min(segments[i]["s0"] for i in members)
+    g1 = max(segments[i]["s1"] for i in members)
+    if np.isnan(fs).any() or not np.isfinite(fs).all() or float(fs.max()) <= 0.0:
+        return {"pc": root, "s0": g0, "s1": g1, "dur_w": float(g1 - g0)}
+    fmed = float(np.median(fs))
+    bins = np.round(np.log2(fs / fmed))
+    vals = np.unique(bins)
+    bws = [float(ws[bins == v].sum()) for v in vals]
+    best_bin = vals[int(np.argmax(bws))]
+    sel = bins == best_bin
+    f_final = float(np.sum(fs[sel] * ws[sel]) / float(ws[sel].sum()))
+    wsum = float(ws.sum())
+    return {"pc": root, "f": f_final,
+            "resid": float(np.average([float(segments[i].get("resid", 9.0)) for i in members], weights=ws)),
+            "consistency": float(np.average([float(segments[i].get("consistency", 0.0)) for i in members], weights=ws)),
+            "voiced_frac": float(np.average([float(segments[i].get("voiced_frac", 0.0)) for i in members], weights=ws)),
+            "tonal_mean": float(np.average([float(segments[i].get("tonal_mean", 0.0)) for i in members], weights=ws)),
+            "trust_ok": bool(np.average([1.0 if segments[i].get("trust_ok") else 0.0 for i in members], weights=ws) >= 0.5),
+            "t0": float(min(segments[i]["t0"] for i in members)),
+            "t1": float(max(segments[i]["t1"] for i in members))}
+
+
 def canonize_groups(segments):
     if len(segments) <= 1:
         return segments, True
@@ -604,7 +629,7 @@ def canonize_groups(segments):
     best = groups[best_i]
     sm = float(durs.sum())
 
-    if len(best) >= 2 and len(groups) >= 3:
+    if len(groups) >= 3 and totals[best_i] / sm >= 0.35:
         root = float(segments[best[0]]["pc"])
         for offs in ([0.0, 200.0, 400.0, 500.0, 700.0, 900.0, 1100.0],
                      [0.0, 200.0, 300.0, 500.0, 700.0, 800.0, 1000.0]):
@@ -612,20 +637,12 @@ def canonize_groups(segments):
                 any(circ_diff_c(float(segments[g[0]]["pc"]), root + o) <= 25.0 for o in offs)
                 for g in groups)
             if all_in:
-                g0 = min(segments[i]["s0"] for g in groups for i in g)
-                g1 = max(segments[i]["s1"] for g in groups for i in g)
-                merged = {"pc": root, "s0": g0, "s1": g1, "dur_w": float(g1 - g0)}
-                return [merged], True
+                return [compose_single(segments, best, root)], True
 
     if totals[best_i] / sm >= 0.55:
         second = max(t for j, t in enumerate(totals) if j != best_i) if len(totals) > 1 else 0.0
         if second / sm <= 0.35:
-            g0 = min(segments[i]["s0"] for i in best)
-            g1 = max(segments[i]["s1"] for i in best)
-            pcs = [segments[i]["pc"] for i in best]
-            ws = durs[best]
-            merged = {"pc": circ_mean_c(pcs, ws), "s0": g0, "s1": g1, "dur_w": float(g1 - g0)}
-            return [merged], True
+            return [compose_single(segments, best, float(segments[best[0]]["pc"]))], True
     return segments, False
 
 

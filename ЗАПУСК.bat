@@ -1,5 +1,4 @@
 @echo off
-chcp 65001 >nul
 set "PY=python"
 where py >nul 2>nul
 if not errorlevel 1 set "PY=py -3"

@@ -603,6 +603,20 @@ def canonize_groups(segments):
     best_i = int(np.argmax(totals))
     best = groups[best_i]
     sm = float(durs.sum())
+
+    if len(best) >= 2 and len(groups) >= 3:
+        root = float(segments[best[0]]["pc"])
+        for offs in ([0.0, 200.0, 400.0, 500.0, 700.0, 900.0, 1100.0],
+                     [0.0, 200.0, 300.0, 500.0, 700.0, 800.0, 1000.0]):
+            all_in = all(
+                any(circ_diff_c(float(segments[g[0]]["pc"]), root + o) <= 25.0 for o in offs)
+                for g in groups)
+            if all_in:
+                g0 = min(segments[i]["s0"] for g in groups for i in g)
+                g1 = max(segments[i]["s1"] for g in groups for i in g)
+                merged = {"pc": root, "s0": g0, "s1": g1, "dur_w": float(g1 - g0)}
+                return [merged], True
+
     if totals[best_i] / sm >= 0.55:
         second = max(t for j, t in enumerate(totals) if j != best_i) if len(totals) > 1 else 0.0
         if second / sm <= 0.35:

@@ -28,6 +28,9 @@ MERGE_TOL = 35.0
 TONAL_MIN = 0.30
 
 W_PENALTY = 2.0
+MOD_SHARE = 0.70
+MIN_MOD_SEC = 25.0
+MOD_MASS = 0.12
 
 
 def load_audio(path):
@@ -612,7 +615,7 @@ def compose_single(segments, members, root):
             "t1": float(max(segments[i]["t1"] for i in members))}
 
 
-def canonize_groups(segments):
+def canonize_groups(segments, yb, y, times, f0s, rmss, tonals, valid, log):
     if len(segments) <= 1:
         return segments, True
     durs = np.array([s["dur_w"] for s in segments])
@@ -628,9 +631,24 @@ def canonize_groups(segments):
     best_i = int(np.argmax(totals))
     best = groups[best_i]
     sm = float(durs.sum())
+    root = float(segments[best[0]]["pc"])
+
+    mod = find_modulation(segments, groups, durs, root)
+    if mod is not None:
+        k0, s0, s1 = mod
+        log("  ...модуляция ближе к концу, уточнение нового тона...")
+        cand_pcs = [float(segments[i]["pc"]) for i in groups[k0]]
+        merged = {"pc": float(np.median(cand_pcs)), "s0": int(s0), "s1": int(s1),
+                  "dur_w": float(s1 - s0)}
+        mod_seg = refine_segments(yb, y, [merged], times, f0s, rmss, tonals, valid, log)[0]
+        main_seg = compose_single(segments, best, root)
+        main_seg["s0"] = int(segments[best[0]]["s0"])
+        main_seg["s1"] = int(s0)
+        main_seg["dur_w"] = float(main_seg["s1"] - main_seg["s0"])
+        main_seg["t1"] = float(times[s0] - HOP_SEC / 2.0)
+        return [main_seg, mod_seg], False
 
     if len(groups) >= 3 and totals[best_i] / sm >= 0.35:
-        root = float(segments[best[0]]["pc"])
         for offs in ([0.0, 200.0, 400.0, 500.0, 700.0, 900.0, 1100.0],
                      [0.0, 200.0, 300.0, 500.0, 700.0, 800.0, 1000.0]):
             all_in = all(
@@ -642,8 +660,32 @@ def canonize_groups(segments):
     if totals[best_i] / sm >= 0.55:
         second = max(t for j, t in enumerate(totals) if j != best_i) if len(totals) > 1 else 0.0
         if second / sm <= 0.35:
-            return [compose_single(segments, best, float(segments[best[0]]["pc"]))], True
+            return [compose_single(segments, best, root)], True
     return segments, False
+
+
+def find_modulation(segments, groups, durs, root):
+    n = len(segments)
+    last = segments[-1]
+    if circ_diff_c(float(last["pc"]), root) <= 25.0:
+        return None
+    grp_of = {}
+    for gi, g in enumerate(groups):
+        for i in g:
+            grp_of[i] = gi
+    k0 = grp_of[n - 1]
+    cut = int(segments[n - 1]["s0"])
+    for i in range(n - 2, -1, -1):
+        mass = float(sum(durs[j] for j in range(i, n) if grp_of[j] == k0))
+        tot = float(durs[i:n].sum())
+        if mass / tot >= MOD_SHARE:
+            cut = int(segments[i]["s0"])
+    mass_k = float(sum(durs[i] for i in range(n) if grp_of[i] == k0))
+    if (segments[n - 1]["s1"] - cut) * HOP_SEC < MIN_MOD_SEC:
+        return None
+    if mass_k / float(durs.sum()) < MOD_MASS:
+        return None
+    return k0, cut, int(segments[n - 1]["s1"])
 
 
 def local_dominant_pc(pcs, valid, weights, half_w=16):
@@ -740,7 +782,7 @@ def analyze(path, log):
     log("Уточнение частоты (фазовый метод)...")
     segments = refine_segments(yb, y, segments, times, f0s, rmss, tonals, valid, log)
     log("Сверка тональностей по всему произведению...")
-    segments, single = canonize_groups(segments)
+    segments, single = canonize_groups(segments, yb, y, times, f0s, rmss, tonals, valid, log)
 
     if single and (len(segments) > 1 or "f" not in segments[0]):
         log("  ...единый тон по всему произведению, уточнение...")

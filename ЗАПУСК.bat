@@ -1,4 +1,7 @@
 @echo off
 chcp 65001 >nul
-python "%~dp0tonic_analyzer.py"
+set "PY=python"
+where py >nul 2>nul
+if not errorlevel 1 set "PY=py -3"
+%PY% "%~dp0tonic_analyzer.py"
 if errorlevel 1 pause

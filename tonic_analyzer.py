@@ -437,7 +437,7 @@ def refine_segments(yb, y, segments, times, f0s, rmss, tonals, valid, log):
             else:
                 seg["f"] = f_phase
                 seg["resid"] = r_phase
-                seg["trust_ok"] = bool(r_phase < 0.5)
+                seg["trust_ok"] = bool(r_phase < 0.5 or (f_spec is not None and disp < 0.05))
         else:
             if f_spec is not None:
                 seg["f"] = f_spec
@@ -450,7 +450,8 @@ def refine_segments(yb, y, segments, times, f0s, rmss, tonals, valid, log):
                 seg["resid"] = 99.0
                 seg["consistency"] = 0.0
                 seg["trust_ok"] = False
-        seg["voiced_frac"] = float(vm.mean()) if seg["s1"] > seg["s0"] else 0.0
+        n_valid = int(vm.sum())
+        seg["voiced_frac"] = (float(len(frames_ok)) / n_valid if n_valid else 0.0) if seg["s1"] > seg["s0"] else 0.0
         seg["tonal_mean"] = float(tonals[seg["s0"]:seg["s1"]][vm].mean()) if vm.any() else 0.0
         seg["dur_w"] = float(seg["s1"] - seg["s0"])
 
@@ -502,26 +503,31 @@ def merge_same_pc(segments):
     return segments
 
 
-def collapse_clusters(segments):
+def canonize_groups(segments):
     if len(segments) <= 1:
         return segments, True
     durs = np.array([s["dur_w"] for s in segments])
-    idx_order = np.argsort(durs)[::-1]
-    clusters = [[int(idx_order[0])]]
-    for i in idx_order[1:]:
-        i = int(i)
-        placed = False
-        for cl in clusters:
-            if circ_diff_c(segments[i]["pc"], segments[cl[0]]["pc"]) <= CENTS_TOL:
-                cl.append(i)
-                placed = True
+    groups = []
+    for i, s in enumerate(segments):
+        for g in groups:
+            if circ_diff_c(s["pc"], segments[g[0]]["pc"]) <= 25.0:
+                g.append(i)
                 break
-        if not placed:
-            clusters.append([i])
-    totals = [sum(durs[cl]) for cl in clusters]
-    best = clusters[int(np.argmax(totals))]
-    if float(max(totals)) / float(durs.sum()) >= 0.65:
-        return [segments[i] for i in best], True
+        else:
+            groups.append([i])
+    totals = [float(durs[g].sum()) for g in groups]
+    best_i = int(np.argmax(totals))
+    best = groups[best_i]
+    sm = float(durs.sum())
+    if len(best) >= 2 and best_i >= 0 and totals[best_i] / sm >= 0.35:
+        second = max(t for j, t in enumerate(totals) if j != best_i) if len(totals) > 1 else 0.0
+        if second / sm <= 0.30:
+            g0 = min(segments[i]["s0"] for i in best)
+            g1 = max(segments[i]["s1"] for i in best)
+            pcs = [segments[i]["pc"] for i in best]
+            ws = durs[best]
+            merged = {"pc": circ_mean_c(pcs, ws), "s0": g0, "s1": g1, "dur_w": float(g1 - g0)}
+            return [merged], True
     return segments, False
 
 
@@ -618,21 +624,12 @@ def analyze(path, log):
     segments = ovoid_short_segments(segments)
     log("Уточнение частоты (фазовый метод)...")
     segments = refine_segments(yb, y, segments, times, f0s, rmss, tonals, valid, log)
-    segments, single = collapse_clusters(segments)
+    log("Сверка тональностей по всему произведению...")
+    segments, single = canonize_groups(segments)
 
-    if single and len(segments) > 1:
-        segs = segments
-        pc = circ_mean_c([s["pc"] for s in segs], np.array([s["dur_w"] for s in segs]))
-        ws = np.array([s["dur_w"] * max(1e-6, s["consistency"]) for s in segs])
-        f = float(np.sum([s["f"] * ws[i] for i, s in enumerate(segs)]) / np.sum(ws))
-        rr = [s for s in segs if s["resid"] < 5.0]
-        resid = float(np.mean([s["resid"] for s in rr])) if rr else 99.0
-        segments = [{"pc": pc, "f": f, "resid": resid,
-                     "consistency": float(np.mean([s["consistency"] for s in segs])),
-                     "voiced_frac": float(np.mean([s["voiced_frac"] for s in segs])),
-                     "tonal_mean": float(np.mean([s["tonal_mean"] for s in segs])),
-                     "trust_ok": bool(np.mean([is_good(s) for s in segs]) >= 0.5),
-                     "t0": 0.0, "t1": dur}]
+    if single and (len(segments) > 1 or "f" not in segments[0]):
+        log("  ...единый тон по всему произведению, уточнение...")
+        segments = refine_segments(yb, y, segments, times, f0s, rmss, tonals, valid, log)
 
     for i, seg in enumerate(segments):
         if i == 0:

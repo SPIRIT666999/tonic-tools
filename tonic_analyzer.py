@@ -694,11 +694,12 @@ def merge_equal_segments(segments, tol=3.0):
         if out:
             a = out[-1]
             fa, fs = a.get("f", float("nan")), s.get("f", float("nan"))
-            if np.isfinite(fa) and np.isfinite(fs) and abs(cents(fa) - cents(fs)) <= tol:
+            if np.isfinite(fa) and np.isfinite(fs) and abs(cents(fa) - cents(fs)) <= tol \
+                    and "s0" in a and "s1" in a and "s1" in s and "s0" in s:
                 a["s1"] = s["s1"]
                 a["t1"] = s.get("t1", a.get("t1"))
                 a["dur_w"] = float(a["s1"] - a["s0"])
-                total = a["dur_w"] + s["dur_w"]
+                total = a.get("dur_w", 0.0) + s.get("dur_w", 0.0)
                 if total > 0:
                     a["voiced_frac"] = (a.get("voiced_frac", 0.0) * a["dur_w"] + s.get("voiced_frac", 0.0) * s["dur_w"]) / total
                 a["resid"] = min(a.get("resid", 9.0), s.get("resid", 9.0))
@@ -745,6 +746,7 @@ def compose_single(segments, members, root, votes=None):
     sel = bins == best_bin
     f_final = float(np.sum(fs[sel] * ws[sel]) / float(ws[sel].sum()))
     return {"pc": root, "f": f_final,
+            "s0": int(g0), "s1": int(g1), "dur_w": float(g1 - g0),
             "resid": float(np.average([float(segments[i].get("resid", 9.0)) for i in members], weights=ws)),
             "consistency": float(np.average([float(segments[i].get("consistency", 0.0)) for i in members], weights=ws)),
             "voiced_frac": float(np.average([float(segments[i].get("voiced_frac", 0.0)) for i in members], weights=ws)),

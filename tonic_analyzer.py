@@ -28,9 +28,14 @@ MERGE_TOL = 35.0
 TONAL_MIN = 0.30
 
 W_PENALTY = 2.0
-MOD_SHARE = 0.70
 MIN_MOD_SEC = 25.0
 MOD_MASS = 0.12
+CHROMA_STEP_SEC = 5.0
+CHROMA_FRAME_SEC = 1.0
+KEY_W_SEC = 30.0
+KEY_HOP_SEC = 15.0
+KEY_CORR_MIN = 0.70
+KEY_ROOT_TOL = 50.0
 
 
 def load_audio(path):
@@ -300,6 +305,98 @@ def build_runs(frames_ok, max_gap=2):
     return runs
 
 
+def _fundamental_peak(M, fk, f0):
+    tol0 = 0.04 * f0 + 2.0
+    i1 = int(np.searchsorted(fk, f0 - tol0))
+    i2 = int(np.searchsorted(fk, f0 + tol0))
+    if i2 - i1 < 3:
+        return False
+    seg = M[i1:i2]
+    pk = int(np.argmax(seg)) + i1
+    if pk <= 20 or pk >= len(M) - 20:
+        return False
+    if not (M[pk] > M[pk - 1] and M[pk] >= M[pk + 1]):
+        return False
+    loc = float(np.median(M[max(0, pk - 40):pk + 41]))
+    if loc <= 1e-12:
+        return False
+    return float(M[pk]) / max(M.max(), 1e-12) >= 0.025 and float(M[pk]) / loc >= 3.0
+
+
+def common_fundamental_fix(yb, segments):
+    good = [s for s in segments
+            if np.isfinite(s.get("f", float("nan"))) and float(s["f"]) >= FMIN
+            and float(s.get("resid", 9.0)) < 1.0]
+    if not good:
+        return
+    anchor = max(good, key=lambda s: float(s["dur_w"]))
+    nfft = NFFT
+    freqs = np.fft.rfftfreq(nfft, d=1.0 / SR)
+    keep = (freqs >= FMIN * 0.75) & (freqs <= HARM_TOP)
+    fk = freqs[keep]
+    Y = yb.astype(np.float64)
+    lf = min(3 * SR, len(Y))
+    step = max(lf, (len(Y) - lf) // 8)
+    win = np.hanning(lf)
+    mags = []
+    for j in range(0, max(1, len(Y) - lf + 1), step):
+        mags.append(np.abs(np.fft.rfft(Y[j:j + lf] * win, nfft))[keep])
+        if len(mags) >= 8:
+            break
+    if not mags:
+        return
+    stack = np.stack(mags)
+    M = np.median(stack, axis=0)
+    Mmax = float(M.max())
+    wmax = np.maximum(stack.max(axis=0), 1e-12)
+    Mn_f = np.max(stack / wmax[None, :], axis=0)
+    if Mmax <= 1e-9:
+        return
+    best = None
+    for div in (8.0, 6.0, 4.0, 3.0, 2.0):
+        f0 = float(anchor["f"]) / div
+        if not (55.0 <= f0 <= FMAX):
+            continue
+        tot = expl = 0.0
+        for s in good:
+            r = float(s["f"]) / f0
+            k = int(round(r))
+            tot += float(s["dur_w"])
+            if 1 <= k <= 8 and abs(1200.0 * np.log2(max(r / k, 1e-9))) <= 40.0:
+                expl += float(s["dur_w"])
+        if tot <= 0 or expl / tot < 0.75:
+            continue
+        if not _fundamental_peak(M, fk, f0):
+            continue
+        cnt = 0
+        for k in (3, 4, 5, 6):
+            kf = f0 * k
+            tolk = 0.04 * kf + 2.0
+            kk = (fk >= kf - tolk) & (fk <= kf + tolk)
+            if kk.any() and float(Mn_f[kk].max()) >= 0.05:
+                cnt += 1
+        single = len(good) == 1
+        if single and (cnt < 2 or float(anchor.get("resid", 9.0)) >= 0.5):
+            continue
+        best = f0
+        break
+    if best is None:
+        return
+    f0 = best
+    for s in segments:
+        f_s = float(s.get("f", float("nan")))
+        clean = np.isfinite(f_s) and f_s >= 0.5 * f0 and f_s >= FMIN and float(s.get("resid", 9.0)) < 1.0
+        if clean:
+            r = f_s / f0
+            k = int(round(r))
+            if 1 <= k <= 8 and abs(1200.0 * np.log2(max(r / k, 1e-9))) <= 40.0:
+                s["f"] = round(f0, 3)
+                continue
+        s["f"] = round(f0, 3)
+        s["resid"] = max(float(s.get("resid", 9.0)), 1.0)
+        s["trust_ok"] = False
+
+
 def segment_octave_fix(yb, seg):
     from scipy.ndimage import maximum_filter1d
 
@@ -544,6 +641,7 @@ def refine_segments(yb, y, segments, times, f0s, rmss, tonals, valid, log):
     for seg in segments:
         segment_octave_fix(yb, seg)
         missing_fundamental_fix(yb, seg)
+    common_fundamental_fix(yb, segments)
 
     return segments
 
@@ -590,7 +688,43 @@ def merge_same_pc(segments):
     return segments
 
 
-def compose_single(segments, members, root):
+def merge_equal_segments(segments, tol=3.0):
+    out = []
+    for s in segments:
+        if out:
+            a = out[-1]
+            fa, fs = a.get("f", float("nan")), s.get("f", float("nan"))
+            if np.isfinite(fa) and np.isfinite(fs) and abs(cents(fa) - cents(fs)) <= tol:
+                a["s1"] = s["s1"]
+                a["t1"] = s.get("t1", a.get("t1"))
+                a["dur_w"] = float(a["s1"] - a["s0"])
+                total = a["dur_w"] + s["dur_w"]
+                if total > 0:
+                    a["voiced_frac"] = (a.get("voiced_frac", 0.0) * a["dur_w"] + s.get("voiced_frac", 0.0) * s["dur_w"]) / total
+                a["resid"] = min(a.get("resid", 9.0), s.get("resid", 9.0))
+                a["trust_ok"] = bool(a.get("trust_ok", False) or s.get("trust_ok", False))
+                continue
+        out.append(s)
+    return out
+
+
+_KK_MAJOR = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+_KK_MINOR = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+
+
+def register_votes(r0, r1, f0s, pcs, valid, root_pc, tol=25.0):
+    votes = {}
+    for i in range(max(0, r0), min(r1, len(f0s))):
+        if not valid[i] or np.isnan(f0s[i]):
+            continue
+        if circ_diff_c(float(pcs[i]), float(root_pc)) > tol:
+            continue
+        b = int(np.floor(cents(f0s[i]) / 1200.0))
+        votes[b] = votes.get(b, 0) + 1
+    return votes
+
+
+def compose_single(segments, members, root, votes=None):
     fs = np.array([float(segments[i].get("f", float("nan"))) for i in members])
     ws = np.array([segments[i]["dur_w"] for i in members])
     g0 = min(segments[i]["s0"] for i in members)
@@ -600,11 +734,16 @@ def compose_single(segments, members, root):
     fmed = float(np.median(fs))
     bins = np.round(np.log2(fs / fmed))
     vals = np.unique(bins)
-    bws = [float(ws[bins == v].sum()) for v in vals]
-    best_bin = vals[int(np.argmax(bws))]
+    bws = np.array([float(ws[bins == v].sum()) for v in vals])
+    w_share = bws / bws.sum()
+    if votes:
+        vtot = float(sum(votes.values()))
+        if vtot > 0:
+            vb = np.array([float(votes.get(int(v), 0)) for v in vals]) / vtot
+            w_share = w_share + vb
+    best_bin = vals[int(np.argmax(w_share))]
     sel = bins == best_bin
     f_final = float(np.sum(fs[sel] * ws[sel]) / float(ws[sel].sum()))
-    wsum = float(ws.sum())
     return {"pc": root, "f": f_final,
             "resid": float(np.average([float(segments[i].get("resid", 9.0)) for i in members], weights=ws)),
             "consistency": float(np.average([float(segments[i].get("consistency", 0.0)) for i in members], weights=ws)),
@@ -613,6 +752,150 @@ def compose_single(segments, members, root):
             "trust_ok": bool(np.average([1.0 if segments[i].get("trust_ok") else 0.0 for i in members], weights=ws) >= 0.5),
             "t0": float(min(segments[i]["t0"] for i in members)),
             "t1": float(max(segments[i]["t1"] for i in members))}
+
+
+def _chroma_dict(det_c, fb, df):
+    A = np.zeros((fb.size, 12))
+    for pp in range(12):
+        c = pp * 100.0 + det_c
+        col = np.zeros(fb.size)
+        for o in range(1, 7):
+            f0 = RNF * (2.0 ** (c / 1200.0)) * (2.0 ** o)
+            if f0 < 40.0 or f0 > 2000.0:
+                continue
+            h = 1
+            while h <= 8 and f0 * h <= 2000.0:
+                col += (1.0 / h) * np.exp(-0.5 * ((fb - f0 * h) / (2.2 * df)) ** 2)
+                h += 1
+        nrm = float(np.linalg.norm(col))
+        A[:, pp] = col / nrm if nrm > 0 else col
+    return A
+
+
+def nnls_chroma_track(yb, log):
+    from scipy.optimize import nnls
+    flen = int(CHROMA_FRAME_SEC * SR)
+    nfft = 32768
+    freqs = np.fft.rfftfreq(nfft, d=1.0 / SR)
+    band = (freqs >= 40.0) & (freqs <= 2000.0)
+    fb = freqs[band]
+    df = float(freqs[1] - freqs[0])
+    n = len(yb)
+    positions = list(range(0, max(1, n - flen + 1), int(CHROMA_STEP_SEC * SR)))
+    if not positions:
+        positions = [0]
+    win = np.hanning(flen)
+    mags = []
+    for p in positions:
+        chunk = yb[p:p + flen].astype(np.float64)
+        w = np.zeros(flen, dtype=np.float64)
+        w[:len(chunk)] = chunk * win[:len(chunk)]
+        mags.append(np.abs(np.fft.rfft(w, nfft))[band])
+    mags = np.array(mags, dtype=np.float64)
+    mm = float(mags.max())
+    if mm <= 0:
+        return np.array([]), np.zeros((12, 0)), 0.0
+    mags /= mm
+
+    def solve(det, idx):
+        A = _chroma_dict(det, fb, df)
+        C = np.zeros((12, len(idx)))
+        for j, i in enumerate(idx):
+            try:
+                c, _ = nnls(A, mags[i], maxiter=200)
+            except Exception:
+                c = np.zeros(12)
+            C[:, j] = c
+        return C
+
+    sub = list(range(0, len(positions), 4))[:16]
+    best_det, best_sc = 0.0, -1.0
+    for det in range(-50, 51, 10):
+        C = solve(float(det), sub)
+        v = C.mean(axis=1)
+        if float(v.sum()) <= 1e-12:
+            continue
+        sc = float(v.max()) / max(1e-12, float(v.mean()))
+        if sc > best_sc:
+            best_sc, best_det = sc, float(det)
+    C = solve(best_det, list(range(len(positions))))
+    ch_times = np.array([p / float(SR) for p in positions])
+    return ch_times, C, best_det
+
+
+def key_track_windows(C, ch_times, det):
+    w = max(2, int(round(KEY_W_SEC / CHROMA_STEP_SEC)))
+    hop = max(1, int(round(KEY_HOP_SEC / CHROMA_STEP_SEC)))
+    pr_maj = _KK_MAJOR / np.linalg.norm(_KK_MAJOR)
+    pr_min = _KK_MINOR / np.linalg.norm(_KK_MINOR)
+    wins = []
+    for wi in range(0, max(1, C.shape[1] - w + 1), hop):
+        v = C[:, wi:wi + w].mean(axis=1)
+        if float(v.sum()) <= 1e-9:
+            continue
+        vn = v / (np.linalg.norm(v) + 1e-12)
+        best = None
+        for r in range(12):
+            for pr in (pr_maj, pr_min):
+                cc = float(np.dot(vn, np.roll(pr, r)))
+                if best is None or cc > best[0]:
+                    best = (cc, r)
+        if best is not None and best[0] >= KEY_CORR_MIN:
+            wins.append({"t0": float(ch_times[wi]),
+                         "t1": float(ch_times[min(C.shape[1] - 1, wi + w - 1)] + CHROMA_STEP_SEC),
+                         "pc": (best[1] * 100.0 + det) % 1200.0})
+    runs = []
+    for k in wins:
+        last_pc = runs[-1]["pcs"][-1] if runs else None
+        if runs and circ_diff_c(k["pc"], last_pc) <= KEY_ROOT_TOL and k["t0"] - runs[-1]["t1"] <= CHROMA_STEP_SEC * 1.5:
+            runs[-1]["t1"] = k["t1"]
+            runs[-1]["pcs"].append(k["pc"])
+        else:
+            runs.append({"t0": k["t0"], "t1": k["t1"], "pcs": [k["pc"]]})
+    for r in runs:
+        r["pc"] = float(np.median(r["pcs"]))
+    return runs
+
+
+def detect_key_blocks(segments, groups, durs, root, ch_times, C, det):
+    runs = key_track_windows(C, ch_times, det)
+    data_idx = [j for j in range(C.shape[1]) if float(C[:, j].sum()) > 1e-9]
+    cover_end = float(ch_times[data_idx[-1]]) if data_idx else 0.0
+    runs = [r for r in runs if r["t1"] >= cover_end - 1.0]
+    total = float(durs.sum())
+    cands = []
+    for run in runs:
+        if (run["t1"] - run["t0"]) < MIN_MOD_SEC:
+            continue
+        if circ_diff_c(run["pc"], root) <= 25.0:
+            continue
+        gi, bestm = None, -1.0
+        for g in range(len(groups)):
+            if circ_diff_c(float(segments[groups[g][0]]["pc"]), run["pc"]) <= KEY_ROOT_TOL:
+                m = float(durs[groups[g]].sum())
+                if m > bestm:
+                    bestm, gi = m, g
+        if gi is None or bestm / total < MOD_MASS:
+            continue
+        ov = [i for i in groups[gi] if segments[i]["t0"] < run["t1"] and segments[i]["t1"] > run["t0"]]
+        if not ov:
+            continue
+        s0f = int(min(segments[i]["s0"] for i in ov))
+        s1f = int(max(segments[i]["s1"] for i in ov))
+        if (s1f - s0f) * HOP_SEC < MIN_MOD_SEC:
+            continue
+        cands.append({"s0": s0f, "s1": s1f,
+                      "pc": float(np.median([segments[i]["pc"] for i in ov])),
+                      "mass": bestm})
+    cands.sort(key=lambda b: (b["s0"], -b["mass"]))
+    out = []
+    for b in cands:
+        if out and b["s0"] < out[-1]["s1"]:
+            if b["mass"] > out[-1]["mass"]:
+                out[-1] = b
+            continue
+        out.append(b)
+    return out
 
 
 def canonize_groups(segments, yb, y, times, f0s, rmss, tonals, valid, log):
@@ -632,21 +915,45 @@ def canonize_groups(segments, yb, y, times, f0s, rmss, tonals, valid, log):
     best = groups[best_i]
     sm = float(durs.sum())
     root = float(segments[best[0]]["pc"])
+    n_fr = len(f0s)
+    pcs_arr = np.mod(cents(f0s), 1200.0)
 
-    mod = find_modulation(segments, groups, durs, root)
-    if mod is not None:
-        k0, s0, s1 = mod
-        log("  ...модуляция ближе к концу, уточнение нового тона...")
-        cand_pcs = [float(segments[i]["pc"]) for i in groups[k0]]
-        merged = {"pc": float(np.median(cand_pcs)), "s0": int(s0), "s1": int(s1),
-                  "dur_w": float(s1 - s0)}
-        mod_seg = refine_segments(yb, y, [merged], times, f0s, rmss, tonals, valid, log)[0]
-        main_seg = compose_single(segments, best, root)
-        main_seg["s0"] = int(segments[best[0]]["s0"])
-        main_seg["s1"] = int(s0)
-        main_seg["dur_w"] = float(main_seg["s1"] - main_seg["s0"])
-        main_seg["t1"] = float(times[s0] - HOP_SEC / 2.0)
-        return [main_seg, mod_seg], False
+    blocks = []
+    try:
+        log("  ...скользящая проверка локальных тональностей (хрома)...")
+        ch_times, C, det = nnls_chroma_track(yb, log)
+        if C.shape[1] > 0:
+            blocks = detect_key_blocks(segments, groups, durs, root, ch_times, C, det)
+    except Exception:
+        blocks = []
+
+    if blocks:
+        log("  ...устойчивые сдвиги тона: вычленение модуляций...")
+        out = []
+        cur = 0
+        spans = []
+        for b in blocks:
+            spans.append((cur, b["s0"]))
+            cur = b["s1"]
+        spans.append((cur, n_fr))
+        for (r0, r1), b in zip(spans, blocks + [None]):
+            r1 = max(r1, r0)
+            if r1 - r0 >= int(MIN_SEG_SEC / HOP_SEC):
+                votes = register_votes(r0, r1, f0s, pcs_arr, valid, root)
+                mem = [i for i in best if segments[i]["s1"] > r0 and segments[i]["s0"] < r1]
+                ms = compose_single(segments, mem if mem else best, root, votes)
+                ms["t0"] = float(times[r0] - HOP_SEC / 2.0)
+                ms["t1"] = float(times[min(r1, n_fr - 1)] - HOP_SEC / 2.0)
+                out.append(ms)
+            if b is not None:
+                merged = {"pc": b["pc"], "s0": int(b["s0"]), "s1": int(b["s1"]),
+                          "dur_w": float(b["s1"] - b["s0"])}
+                out.append(refine_segments(yb, y, [merged], times, f0s, rmss, tonals, valid, log)[0])
+        if len(out) == 1:
+            return out, True
+        return out, False
+
+    votes_all = register_votes(0, n_fr, f0s, pcs_arr, valid, root)
 
     if len(groups) >= 3 and totals[best_i] / sm >= 0.35:
         for offs in ([0.0, 200.0, 400.0, 500.0, 700.0, 900.0, 1100.0],
@@ -655,37 +962,13 @@ def canonize_groups(segments, yb, y, times, f0s, rmss, tonals, valid, log):
                 any(circ_diff_c(float(segments[g[0]]["pc"]), root + o) <= 25.0 for o in offs)
                 for g in groups)
             if all_in:
-                return [compose_single(segments, best, root)], True
+                return [compose_single(segments, best, root, votes_all)], True
 
     if totals[best_i] / sm >= 0.55:
         second = max(t for j, t in enumerate(totals) if j != best_i) if len(totals) > 1 else 0.0
         if second / sm <= 0.35:
-            return [compose_single(segments, best, root)], True
+            return [compose_single(segments, best, root, votes_all)], True
     return segments, False
-
-
-def find_modulation(segments, groups, durs, root):
-    n = len(segments)
-    last = segments[-1]
-    if circ_diff_c(float(last["pc"]), root) <= 25.0:
-        return None
-    grp_of = {}
-    for gi, g in enumerate(groups):
-        for i in g:
-            grp_of[i] = gi
-    k0 = grp_of[n - 1]
-    cut = int(segments[n - 1]["s0"])
-    for i in range(n - 2, -1, -1):
-        mass = float(sum(durs[j] for j in range(i, n) if grp_of[j] == k0))
-        tot = float(durs[i:n].sum())
-        if mass / tot >= MOD_SHARE:
-            cut = int(segments[i]["s0"])
-    mass_k = float(sum(durs[i] for i in range(n) if grp_of[i] == k0))
-    if (segments[n - 1]["s1"] - cut) * HOP_SEC < MIN_MOD_SEC:
-        return None
-    if mass_k / float(durs.sum()) < MOD_MASS:
-        return None
-    return k0, cut, int(segments[n - 1]["s1"])
 
 
 def local_dominant_pc(pcs, valid, weights, half_w=16):
@@ -787,6 +1070,8 @@ def analyze(path, log):
     if single and (len(segments) > 1 or "f" not in segments[0]):
         log("  ...единый тон по всему произведению, уточнение...")
         segments = refine_segments(yb, y, segments, times, f0s, rmss, tonals, valid, log)
+
+    segments = merge_equal_segments(segments)
 
     for i, seg in enumerate(segments):
         if i == 0:

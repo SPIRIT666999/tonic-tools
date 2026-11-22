@@ -377,6 +377,89 @@ def segment_octave_fix(yb, seg):
     return seg
 
 
+def missing_fundamental_fix(yb, seg):
+    from scipy.signal import find_peaks
+
+    f = float(seg.get("f", 0.0))
+    if not (FMIN * 2.0 <= f <= FMAX):
+        return seg
+    i0 = max(0, int(float(seg["t0"]) * SR))
+    i1 = min(len(yb), int(float(seg["t1"]) * SR))
+    if i1 - i0 < 2 * SR:
+        return seg
+
+    nfft = NFFT
+    freqs = np.fft.rfftfreq(nfft, d=1.0 / SR)
+    keep = (freqs >= FMIN * 0.75) & (freqs <= HARM_TOP)
+    fk = freqs[keep]
+
+    seg_a = yb[i0:i1].astype(np.float64)
+    lf = min(int(3.0 * SR), len(seg_a))
+    step_lf = max(SR, (len(seg_a) - lf) // 5) if len(seg_a) > lf else SR
+    mags = []
+    win_lf = np.hanning(lf)
+    for j in range(0, max(1, len(seg_a) - lf + 1), step_lf):
+        mags.append(np.abs(np.fft.rfft(seg_a[j:j + lf] * win_lf, n=nfft))[keep])
+        if len(mags) >= 6:
+            break
+    if not mags:
+        return seg
+    M = np.median(np.stack(mags), axis=0)
+    loc = np.where((M[1:-1] > M[:-2]) & (M[1:-1] >= M[2:]))[0] + 1
+    if loc.size == 0:
+        return seg
+    if loc.size > 40:
+        order = np.argsort(M[loc])[::-1][:40]
+        loc = np.sort(loc[order])
+    pk_f = fk[loc]
+    pa = M[loc] / (M[loc].max() + 1e-12)
+    strong = pa >= 0.15
+    if strong.sum() < 2:
+        return seg
+    sf, sa = pk_f[strong], pa[strong]
+
+    def exmask(f0, pf):
+        kf = np.arange(1, HARM_K + 1, dtype=float) * f0
+        kf = kf[kf <= HARM_TOP]
+        d = np.abs(pf[:, None] - kf[None, :]).min(axis=1)
+        return d <= (0.04 * pf + 2.0)
+
+    def series_present(f0):
+        for k in range(2, 7):
+            kf = f0 * k
+            if kf > HARM_TOP:
+                return False
+            tolk = 0.04 * kf + 2.0
+            kk = (fk >= kf - tolk) & (fk <= kf + tolk)
+            bar = 0.012 if k == 6 else 0.10
+            if not (kk.any() and float(M[kk].max()) / (M.max() + 1e-12) >= bar):
+                return False
+        return True
+
+    cur_m = exmask(f, sf)
+    for m in (0.5, 1.0 / 3.0):
+        fs_ = f * m
+        if fs_ < FMIN:
+            continue
+        sub_m = exmask(fs_, sf)
+        if float(sa[sub_m].sum()) < 0.75 * float(sa.sum()):
+            continue
+        gained = sa[~cur_m & sub_m]
+        if gained.size == 0 or float(gained.max()) < 0.20:
+            continue
+        if not series_present(fs_):
+            continue
+        implied = []
+        for pf in sf[sub_m]:
+            n0 = max(1, int(round(pf / fs_)))
+            implied.append(pf / n0)
+        fx = float(np.median(implied))
+        if abs(fx - fs_) <= max(0.3, 0.02 * fs_):
+            seg["f"] = round(fs_, 3)
+        break
+    return seg
+
+
 def refine_segments(yb, y, segments, times, f0s, rmss, tonals, valid, log):
     for seg in segments:
         t0 = max(0.0, times[seg["s0"]] - HOP_SEC / 2.0)
@@ -457,6 +540,7 @@ def refine_segments(yb, y, segments, times, f0s, rmss, tonals, valid, log):
 
     for seg in segments:
         segment_octave_fix(yb, seg)
+        missing_fundamental_fix(yb, seg)
 
     return segments
 
@@ -519,9 +603,9 @@ def canonize_groups(segments):
     best_i = int(np.argmax(totals))
     best = groups[best_i]
     sm = float(durs.sum())
-    if len(best) >= 2 and best_i >= 0 and totals[best_i] / sm >= 0.35:
+    if totals[best_i] / sm >= 0.55:
         second = max(t for j, t in enumerate(totals) if j != best_i) if len(totals) > 1 else 0.0
-        if second / sm <= 0.30:
+        if second / sm <= 0.35:
             g0 = min(segments[i]["s0"] for i in best)
             g1 = max(segments[i]["s1"] for i in best)
             pcs = [segments[i]["pc"] for i in best]

@@ -12,12 +12,14 @@ ARCHIVE_DIR = os.path.join(HERE, "Архив_чатов")
 ULT_PATH = r"D:\MAKACIM\02_ProtonDrive\My files\09_АРХИВ_ЧАТОВ_Lumo"
 
 
-def _has_protondrive(path):
+def _protondrive_in(path):
     try:
-        return any(e.is_dir() and "PROTONDRIVE" in e.name.upper()
-                   for e in os.scandir(path))
+        for e in os.scandir(path):
+            if e.is_dir() and "PROTONDRIVE" in e.name.upper():
+                return e.path
     except OSError:
-        return False
+        pass
+    return None
 
 
 def _find_protondrive_root():
@@ -25,16 +27,18 @@ def _find_protondrive_root():
         drive = letter + ":\\"
         if not os.path.isdir(drive):
             continue
-        if _has_protondrive(drive):
-            return drive
+        hit = _protondrive_in(drive)
+        if hit:
+            return hit
         try:
             tops = [e.path for e in os.scandir(drive)
                     if e.is_dir() and not e.name.startswith((".", "$"))]
         except OSError:
             continue
         for top in tops:
-            if _has_protondrive(top):
-                return top
+            hit = _protondrive_in(top)
+            if hit:
+                return hit
     return None
 
 def _setup_archve_dir():
@@ -46,7 +50,15 @@ def _setup_archve_dir():
             return
         root = _find_protondrive_root()
         if root:
-            ARCHIVE_DIR = os.path.join(root, "My files", "09_АРХИВ_ЧАТОВ_Lumo")
+            myfiles = root
+            try:
+                for e in os.scandir(root):
+                    if e.is_dir() and e.name.lower() == "my files":
+                        myfiles = e.path
+                        break
+            except OSError:
+                pass
+            ARCHIVE_DIR = os.path.join(myfiles, "09_АРХИВ_ЧАТОВ_Lumo")
             os.makedirs(ARCHIVE_DIR, exist_ok=True)
     except OSError:
         pass

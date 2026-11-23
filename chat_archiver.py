@@ -5,15 +5,54 @@ import sys
 import tkinter as tk
 from datetime import datetime
 
+import string
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ARCHIVE_DIR = os.path.join(HERE, "Архив_чатов")
 ULT_PATH = r"D:\MAKACIM\02_ProtonDrive\My files\09_АРХИВ_ЧАТОВ_Lumo"
-try:
-    if os.path.isdir(os.path.dirname(ULT_PATH)) or os.path.isdir(ULT_PATH):
-        ARCHIVE_DIR = ULT_PATH
-        os.makedirs(ARCHIVE_DIR, exist_ok=True)
-except OSError:
-    pass
+
+
+def _has_protondrive(path):
+    try:
+        return any(e.is_dir() and "PROTONDRIVE" in e.name.upper()
+                   for e in os.scandir(path))
+    except OSError:
+        return False
+
+
+def _find_protondrive_root():
+    for letter in string.ascii_uppercase:
+        drive = letter + ":\\"
+        if not os.path.isdir(drive):
+            continue
+        if _has_protondrive(drive):
+            return drive
+        try:
+            tops = [e.path for e in os.scandir(drive)
+                    if e.is_dir() and not e.name.startswith((".", "$"))]
+        except OSError:
+            continue
+        for top in tops:
+            if _has_protondrive(top):
+                return top
+    return None
+
+def _setup_archve_dir():
+    global ARCHIVE_DIR
+    try:
+        if os.path.isdir(os.path.dirname(ULT_PATH)) or os.path.isdir(ULT_PATH):
+            ARCHIVE_DIR = ULT_PATH
+            os.makedirs(ARCHIVE_DIR, exist_ok=True)
+            return
+        root = _find_protondrive_root()
+        if root:
+            ARCHIVE_DIR = os.path.join(root, "My files", "09_АРХИВ_ЧАТОВ_Lumo")
+            os.makedirs(ARCHIVE_DIR, exist_ok=True)
+    except OSError:
+        pass
+
+
+_setup_archve_dir()
 POLL_MS = 1200
 DEFAULT_AUTO_SEC = 120
 IDLE_MS = 3000

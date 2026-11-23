@@ -187,6 +187,7 @@ UI_NOISE = {
 }
 EMAIL_RE = re.compile(r"[\w.\-+]{1,40}@[\w\-]{2,60}\.[A-Za-z]{2,10}")
 STORAGE_RE = re.compile(r"^\d+([.,]\d+)?\s*(гб|gb|мб|mb|тб|tb)$", re.I)
+INSTR_RE = re.compile(r"ИНСТРУКЦИЯ\s+ДЛЯ\s+ЧАТА\s+(.+?)[:：]", re.I)
 
 
 def is_noise_line(ln):
@@ -204,7 +205,17 @@ def is_noise_line(ln):
     return False
 
 
-def chat_name_from_body(raw):
+def chat_name_from_instr(raw):
+    for ln in raw.splitlines()[:200]:
+        mm = INSTR_RE.search(ln)
+        if mm:
+            nm = mm.group(1).strip().strip("═=\"'«» ")
+            if nm:
+                return nm
+    return None
+
+
+def chat_name_from_sidebar(raw):
     lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
     for i, s in enumerate(lines):
         if s.lower() in ("недавно", "recent"):
@@ -215,9 +226,12 @@ def chat_name_from_body(raw):
 
 
 def resolve_chat(title, raw):
+    nm = chat_name_from_instr(raw)
+    if nm:
+        return clean_title(nm)
     tl = (title or "").lower()
     if "lumo" in tl and re.search(r"assistant|privacy|private", tl):
-        nm = chat_name_from_body(raw)
+        nm = chat_name_from_sidebar(raw)
         if nm:
             return clean_title(nm)
     return clean_title(title)

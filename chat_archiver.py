@@ -11,6 +11,7 @@ ULT_PATH = r"D:\MAKACIM\02_ProtonDrive\My files\09_АРХИВ_ЧАТОВ_Lumo"
 try:
     if os.path.isdir(os.path.dirname(ULT_PATH)) or os.path.isdir(ULT_PATH):
         ARCHIVE_DIR = ULT_PATH
+        os.makedirs(ARCHIVE_DIR, exist_ok=True)
 except OSError:
     pass
 POLL_MS = 1200
@@ -163,7 +164,7 @@ def archive_text(chat, text, hashes, tag=""):
 def main():
     root = tk.Tk()
     root.title("Архив чатов")
-    root.geometry("500x240")
+    root.geometry("500x280")
     root.attributes("-topmost", True)
 
     tk.Label(root, text="АРХИВ ЧАТОВ", font=("Consolas", 12, "bold")).pack(pady=(10, 2))
@@ -178,8 +179,11 @@ def main():
     tk.Spinbox(row, from_=30, to=600, increment=30, width=5, textvariable=sec_var).pack(side="left", padx=4)
     tk.Label(row, text="секунд").pack(side="left")
 
-    tk.Label(root, text="Каждый чат сохраняется в свой файл в папке Архив_чатов\n(имя файла = имя вкладки). Ручное Ctrl+C тоже попадает в архив,\nв файл по названию окна, откуда копировал.",
+    tk.Label(root, text="Каждый чат сохраняется в свой файл\n(имя файла = имя вкладки).\nРучное Ctrl+C тоже попадает в архив,\nв файл по названию окна, откуда копировал.",
              justify="left").pack(anchor="w", padx=12)
+    tk.Label(root, text="Склад: " + ARCHIVE_DIR,
+             justify="left", font=("Consolas", 8), fg="#555555",
+             wraplength=470).pack(anchor="w", padx=12)
 
     status_var = tk.StringVar(value="жду...")
     status = tk.Label(root, textvariable=status_var, font=("Consolas", 11), fg="#0a7a0a")

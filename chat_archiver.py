@@ -1,43 +1,66 @@
 import hashlib
 import os
+import re
 import sys
 import tkinter as tk
 from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ARCHIVE = os.path.join(HERE, "Архив_чатов.txt")
-STATE = os.path.join(HERE, "arhiv_state.txt")
+ARCHIVE_DIR = os.path.join(HERE, "Архив_чатов")
 POLL_MS = 1200
-AUTO_SEC = 60
+DEFAULT_AUTO_SEC = 120
+IDLE_MS = 3000
 LUMO_HINTS = ("lumo",)
+BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def clean_title(t):
+    t = re.sub(r"\s*[\|—–\-]\s*Lumo\s*$", "", t, flags=re.I).strip()
+    t = BAD_CHARS.sub("_", t).strip(" ._")
+    t = t[:60].strip()
+    return t or "Без_имени"
+
 
 if sys.platform == "win32":
     import ctypes
     from ctypes import wintypes
 
     user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
 
     EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
-    def find_lumo_window():
+    def window_title(hwnd):
+        ln = user32.GetWindowTextLengthW(hwnd)
+        if ln <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(ln + 1)
+        user32.GetWindowTextW(hwnd, buf, ln + 1)
+        return buf.value
+
+    def find_lumo_windows():
         found = []
 
         @EnumWindowsProc
         def cb(hwnd, lparam):
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            ln = user32.GetWindowTextLengthW(hwnd)
-            if ln <= 0:
-                return True
-            buf = ctypes.create_unicode_buffer(ln + 1)
-            user32.GetWindowTextW(hwnd, buf, ln + 1)
-            t = buf.value.lower()
-            if any(h in t for h in LUMO_HINTS):
-                found.append(hwnd)
+            if user32.IsWindowVisible(hwnd):
+                t = window_title(hwnd)
+                if t and any(h in t.lower() for h in LUMO_HINTS):
+                    found.append((hwnd, t))
             return True
 
         user32.EnumWindows(cb, 0)
-        return found[0] if found else None
+        return found
+
+    def get_idle_ms():
+        class LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+        plii = LASTINPUTINFO()
+        plii.cbSize = ctypes.sizeof(plii)
+        if not user32.GetLastInputInfo(ctypes.byref(plii)):
+            return 0
+        return int(kernel32.GetTickCount() - plii.dwTime) & 0x7FFFFFFF
 
     def send_ctrl_key(vk):
         class KI(ctypes.Structure):
@@ -74,20 +97,28 @@ if sys.platform == "win32":
         user32.SendInput(2, arr, ctypes.sizeof(INP))
 
     def grab_lumo():
-        hwnd = find_lumo_window()
-        if not hwnd:
-            return False
+        wins = find_lumo_windows()
+        if not wins:
+            return None
+        hwnd, title = wins[0]
         prev = user32.GetForegroundWindow()
         press_alt()
-        user32.SetForegroundWindow(hwnd)
+        if not user32.SetForegroundWindow(hwnd):
+            return None
         send_ctrl_key(0x41)
         send_ctrl_key(0x43)
         if prev:
             user32.SetForegroundWindow(prev)
-        return True
+        return title
 else:
+    def find_lumo_windows():
+        return []
+
+    def get_idle_ms():
+        return 10 ** 9
+
     def grab_lumo():
-        return False
+        return None
 
 
 def delta_text(new, prev):
@@ -97,29 +128,28 @@ def delta_text(new, prev):
     return new.strip()
 
 
-def load_hashes():
+def load_hashes(path):
     try:
-        with open(STATE, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return set(f.read().splitlines())
     except OSError:
         return set()
 
 
-def save_hash(h):
-    try:
-        with open(STATE, "a", encoding="utf-8") as f:
-            f.write(h + "\n")
-    except OSError:
-        pass
-
-
-def archive_text(text, hashes, tag=""):
+def archive_text(chat, text, hashes, tag=""):
+    os.makedirs(ARCHIVE_DIR, exist_ok=True)
+    file_txt = os.path.join(ARCHIVE_DIR, chat + ".txt")
+    file_st = os.path.join(ARCHIVE_DIR, chat + ".st")
     h = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
     if h in hashes:
         return False
-    with open(ARCHIVE, "a", encoding="utf-8") as f:
+    with open(file_txt, "a", encoding="utf-8") as f:
         f.write("=== %s %s ===\n%s\n\n" % (datetime.now().strftime("%d.%m.%Y %H:%M:%S"), tag, text))
-    save_hash(h)
+    try:
+        with open(file_st, "a", encoding="utf-8") as f:
+            f.write(h + "\n")
+    except OSError:
+        pass
     hashes.add(h)
     return True
 
@@ -127,57 +157,85 @@ def archive_text(text, hashes, tag=""):
 def main():
     root = tk.Tk()
     root.title("Архив чатов")
-    root.geometry("470x220")
+    root.geometry("500x240")
     root.attributes("-topmost", True)
 
     tk.Label(root, text="АРХИВ ЧАТОВ", font=("Consolas", 12, "bold")).pack(pady=(10, 2))
     auto_var = tk.BooleanVar(value=True)
-    tk.Checkbutton(root, text="Автомат: каждые 60 сек слизывать окно Lumo целиком",
+    tk.Checkbutton(root, text="Автомат: сам копирует окно Lumo (только пока ты не печатаешь)",
                    variable=auto_var).pack(anchor="w", padx=12)
-    tk.Label(root, text="Открыт Lumo - программа сама выделяет и копирует переписку,\nв файл пишется только новое. Можно и вручную: Ctrl+A, Ctrl+C.",
+
+    row = tk.Frame(root)
+    row.pack(anchor="w", padx=12)
+    tk.Label(row, text="каждые").pack(side="left")
+    sec_var = tk.IntVar(value=DEFAULT_AUTO_SEC)
+    tk.Spinbox(row, from_=30, to=600, increment=30, width=5, textvariable=sec_var).pack(side="left", padx=4)
+    tk.Label(row, text="секунд").pack(side="left")
+
+    tk.Label(root, text="Каждый чат сохраняется в свой файл в папке Архив_чатов\n(имя файла = имя вкладки). Ручное Ctrl+C тоже попадает в архив,\nв файл по названию окна, откуда копировал.",
              justify="left").pack(anchor="w", padx=12)
 
     status_var = tk.StringVar(value="жду...")
     status = tk.Label(root, textvariable=status_var, font=("Consolas", 11), fg="#0a7a0a")
     status.pack(pady=6)
 
-    hashes = load_hashes()
-    saved = [0]
-    last = [None]
-    prev_full = [None]
-    auto_pending = [False]
+    hashes = {}
+    prev_full = {}
+    state = {"last": None, "pending_title": None, "saved": 0}
+
+    def chat_hashes(chat):
+        if chat not in hashes:
+            hashes[chat] = load_hashes(os.path.join(ARCHIVE_DIR, chat + ".st"))
+        return hashes[chat]
+
+    def store(chat, body, tag, full=None):
+        if body and archive_text(chat, body, chat_hashes(chat), tag):
+            state["saved"] += 1
+            status_var.set("сохранено: %d  |  последний: %s" % (state["saved"], chat))
+        if full is not None:
+            prev_full[chat] = full
 
     def do_poll():
         try:
             text = root.clipboard_get()
         except Exception:
             text = ""
-        if text and text != last[0]:
-            new = text
-            tag = "авто"
-            if auto_pending[0]:
-                auto_pending[0] = False
-                body = delta_text(text, prev_full[0])
+        if text and text != state["last"]:
+            state["last"] = text
+            if state["pending_title"] is not None:
+                chat = clean_title(state["pending_title"])
+                tag = "авто"
+                pending, state["pending_title"] = state["pending_title"], None
+                body = delta_text(text, prev_full.get(chat))
+                store(chat, body, tag, text)
             else:
-                body = text.strip()
-                tag = "вручную"
-                prev_full[0] = text
-            if body and archive_text(body, hashes, tag):
-                saved[0] += 1
-                status_var.set("сохранено: %d" % saved[0])
-            if tag == "авто":
-                prev_full[0] = text
-            last[0] = text
+                if sys.platform == "win32":
+                    fg = user32.GetForegroundWindow()
+                    chat = clean_title(window_title(fg)) if fg else "Без_имени"
+                else:
+                    chat = "Без_имени"
+                store(chat, text.strip(), "вручную", text)
         root.after(POLL_MS, do_poll)
 
     def do_auto():
+        try:
+            sec = max(30, min(600, int(sec_var.get() or DEFAULT_AUTO_SEC)))
+        except (ValueError, tk.TclError):
+            sec = DEFAULT_AUTO_SEC
         if auto_var.get():
-            if grab_lumo():
-                auto_pending[0] = True
-        root.after(AUTO_SEC * 1000, do_auto)
+            if get_idle_ms() >= IDLE_MS:
+                wins = find_lumo_windows()
+                if not wins:
+                    if not str(status_var.get()).startswith("окно Lumo"):
+                        status_var.set("окно Lumo не найдено")
+                else:
+                    title = grab_lumo()
+                    if title:
+                        state["pending_title"] = title
+        root.after(sec * 1000, do_auto)
 
     root.after(POLL_MS, do_poll)
-    root.after(AUTO_SEC * 1000, do_auto)
+    root.after(DEFAULT_AUTO_SEC * 1000, do_auto)
     root.mainloop()
 
 

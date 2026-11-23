@@ -179,6 +179,76 @@ else:
         return None
 
 
+UI_NOISE = {
+    "новый чат", "все чаты", "проекты", "запланированные", "избранное",
+    "недавно", "настройки", "поиск", "выйти", "справка", "поддержка",
+    "новые чаты", "chats", "projects", "scheduled", "favorites", "recent",
+    "new chat", "all chats", "settings", "search", "lumo", "lumo ai",
+}
+EMAIL_RE = re.compile(r"[\w.\-+]{1,40}@[\w\-]{2,60}\.[A-Za-z]{2,10}")
+STORAGE_RE = re.compile(r"^\d+([.,]\d+)?\s*(гб|gb|мб|mb|тб|tb)$", re.I)
+
+
+def is_noise_line(ln):
+    t = ln.strip().lower()
+    if len(t) > 40:
+        return False
+    if not t:
+        return False
+    if t in UI_NOISE:
+        return True
+    if len(t) < 100 and EMAIL_RE.fullmatch(t):
+        return True
+    if len(t) < 12 and STORAGE_RE.match(t):
+        return True
+    return False
+
+
+def chat_name_from_body(raw):
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    for i, s in enumerate(lines):
+        if s.lower() in ("недавно", "recent"):
+            for t in lines[i + 1:]:
+                if not is_noise_line(t) and len(t) <= 80:
+                    return t
+    return None
+
+
+def resolve_chat(title, raw):
+    tl = (title or "").lower()
+    if "lumo" in tl and re.search(r"assistant|privacy|private", tl):
+        nm = chat_name_from_body(raw)
+        if nm:
+            return clean_title(nm)
+    return clean_title(title)
+
+
+def clean_body(raw):
+    lines = raw.splitlines()
+    stop = None
+    for i, ln in enumerate(lines[:80]):
+        if len(ln) < 100 and EMAIL_RE.search(ln):
+            before = [x.strip().lower() for x in lines[:i]]
+            if any(b in UI_NOISE for b in before):
+                stop = i
+            break
+    if stop is not None:
+        lines = lines[stop + 1:]
+    out = []
+    blank = 0
+    for ln in lines:
+        if is_noise_line(ln):
+            continue
+        if not ln.strip():
+            blank += 1
+            if blank > 2:
+                continue
+        else:
+            blank = 0
+        out.append(ln)
+    return "\n".join(out).strip()
+
+
 def delta_text(new, prev):
     if prev and prev in new:
         tail = new[new.find(prev) + len(prev):]
@@ -264,18 +334,17 @@ def main():
         if text and text != state["last"]:
             state["last"] = text
             if state["pending_title"] is not None:
-                chat = clean_title(state["pending_title"])
-                tag = "авто"
-                pending, state["pending_title"] = state["pending_title"], None
-                body = delta_text(text, prev_full.get(chat))
-                store(chat, body, tag, text)
+                ptitle, state["pending_title"] = state["pending_title"], None
+                chat = resolve_chat(ptitle, text)
+                body = clean_body(delta_text(text, prev_full.get(chat)))
+                store(chat, body, "авто", text)
             else:
                 if sys.platform == "win32":
                     fg = user32.GetForegroundWindow()
-                    chat = clean_title(window_title(fg)) if fg else "Без_имени"
+                    chat = resolve_chat(window_title(fg), text) if fg else "Без_имени"
                 else:
                     chat = "Без_имени"
-                store(chat, text.strip(), "вручную", text)
+                store(chat, clean_body(text), "вручную", text)
         root.after(POLL_MS, do_poll)
 
     def do_auto():

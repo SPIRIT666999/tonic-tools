@@ -7,6 +7,12 @@ from datetime import datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ARCHIVE_DIR = os.path.join(HERE, "Архив_чатов")
+ULT_PATH = r"D:\MAKACIM\02_ProtonDrive\My files\09_АРХИВ_ЧАТОВ_Lumo"
+try:
+    if os.path.isdir(os.path.dirname(ULT_PATH)) or os.path.isdir(ULT_PATH):
+        ARCHIVE_DIR = ULT_PATH
+except OSError:
+    pass
 POLL_MS = 1200
 DEFAULT_AUTO_SEC = 120
 IDLE_MS = 3000
